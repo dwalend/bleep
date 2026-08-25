@@ -101,6 +101,34 @@ object CompilerTestLibraries {
     Fetch().addDependencies(deps*).run().map(_.toPath).toSeq
   }
 
+  /** The munit test framework compiled for Scala.js. */
+  lazy val munitScalaJsLibrary: Seq[Path] = {
+    val deps = Seq(
+      Dependency(Module(Organization("org.scalameta"), ModuleName("munit_sjs1_3")), version.VersionConstraint("1.0.0"))
+    )
+    Fetch().addDependencies(deps*).run().map(_.toPath).toSeq
+  }
+
+  /** The utest test framework compiled for Scala.js. */
+  lazy val utestScalaJsLibrary: Seq[Path] = {
+    val deps = Seq(
+      Dependency(Module(Organization("com.lihaoyi"), ModuleName("utest_sjs1_3")), version.VersionConstraint("0.8.4"))
+    )
+    Fetch().addDependencies(deps*).run().map(_.toPath).toSeq
+  }
+
+  /** The Scala.js test bridge declares `org.scalajs.testing.bridge.Bridge`. A linked test module starts at that object.
+    *
+    * @param scalaJsVersion
+    *   the Scala.js version. The bridge tracks that version exactly.
+    */
+  def scalaJsTestBridgeLibrary(scalaJsVersion: String): Seq[Path] = {
+    val deps = Seq(
+      Dependency(Module(Organization("org.scala-js"), ModuleName("scalajs-test-bridge_2.13")), version.VersionConstraint(scalaJsVersion))
+    )
+    Fetch().addDependencies(deps*).run().map(_.toPath).toSeq
+  }
+
   /** Kotest libraries (runner + assertions) */
   lazy val kotestLibrary: Seq[Path] = {
     val deps = Seq(

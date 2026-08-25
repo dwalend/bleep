@@ -3,7 +3,7 @@ package bleep.bsp
 import bleep.analysis._
 import bleep.bsp.protocol.KillReason
 import bleep.bsp.TaskDag.LinkResult
-import bleep.bsp.TestRunnerTypes.{RunnerEvent, TerminationReason, TestEventHandler, TestResult, TestSuite}
+import bleep.bsp.TestRunnerTypes.{frameworkClassNames, RunnerEvent, TerminationReason, TestEventHandler, TestFramework, TestResult, TestSuite}
 import bleep.bsp.protocol.{OutputChannel, TestStatus}
 import cats.effect.{Deferred, IO}
 import cats.effect.std.Semaphore
@@ -12,17 +12,6 @@ import scala.jdk.CollectionConverters._
 
 /** Runner for Scala Native tests. */
 object ScalaNativeTestRunner {
-
-  /** Detected test framework. */
-  sealed trait TestFramework {
-    def name: String
-  }
-  object TestFramework {
-    case object MUnit extends TestFramework { val name = "munit" }
-    case object ScalaTest extends TestFramework { val name = "scalatest" }
-    case object UTest extends TestFramework { val name = "utest" }
-    case object Unknown extends TestFramework { val name = "unknown" }
-  }
 
   /** Bridge a Deferred kill signal to CancellationToken. Delegates to Outcome.bridgeKillSignal, which returns a Resource that properly lifecycle-manages the
     * listener fiber.
@@ -182,14 +171,6 @@ object ScalaNativeTestRunner {
     */
   def getTestMainClass(@annotation.unused framework: TestFramework): String = TestMainClass
 
-  /** Framework class names for sbt.testing.Framework SPI discovery. */
-  private val frameworkClassNames: Map[TestFramework, List[String]] = Map(
-    TestFramework.MUnit -> List("munit.Framework"),
-    TestFramework.ScalaTest -> List("org.scalatest.tools.Framework", "org.scalatest.tools.ScalaTestFramework"),
-    TestFramework.UTest -> List("utest.runner.Framework"),
-    TestFramework.Unknown -> List("munit.Framework", "org.scalatest.tools.Framework", "utest.runner.Framework")
-  )
-
   /** Run tests in a Scala Native binary using the TestAdapter protocol.
     *
     * This is the proper way to communicate with binaries linked with TestMain. The TestAdapter opens a server socket, passes the port to the binary, and
@@ -205,8 +186,6 @@ object ScalaNativeTestRunner {
     *   handler for test events
     * @param env
     *   environment variables
-    * @param workingDir
-    *   working directory
     * @param scalaNativeVersion
     *   Scala Native version (e.g., "0.5.6")
     * @param killSignal
@@ -252,241 +231,82 @@ object ScalaNativeTestRunner {
   ): TestResult = {
     val instance = CompilerResolver.getScalaNativeTestRunner(scalaNativeVersion)
     val loader = instance.loader
-
-    // Create TestAdapter.Config using builder pattern (Config is an interface in Scala 3)
-    val configClass = loader.loadClass("scala.scalanative.testinterface.adapter.TestAdapter$Config")
-    // Config.apply() returns a default config
-    val configApply = configClass.getMethod("apply")
-    var config: AnyRef = configApply.invoke(null)
-
-    // Set binary file
-    val withBinaryFile = configClass.getMethod("withBinaryFile", classOf[java.io.File])
-    config = withBinaryFile.invoke(config, binary.toFile).asInstanceOf[AnyRef]
-
-    // Set env vars
-    val scalaEnvMap = toScalaMap(env, loader)
-    val mapClass = loader.loadClass("scala.collection.immutable.Map")
-    val withEnvVars = configClass.getMethod("withEnvVars", mapClass)
-    config = withEnvVars.invoke(config, scalaEnvMap.asInstanceOf[AnyRef]).asInstanceOf[AnyRef]
-
-    // Set logger
-    val buildLoggerClass = loader.loadClass("scala.scalanative.build.Logger")
-    val buildLoggerCompanion = loader.loadClass("scala.scalanative.build.Logger$")
-    val buildLoggerObj = buildLoggerCompanion.getField("MODULE$").get(null)
-    val defaultLogger = buildLoggerCompanion.getMethod("default").invoke(buildLoggerObj)
-    val withLogger = configClass.getMethod("withLogger", buildLoggerClass)
-    config = withLogger.invoke(config, defaultLogger).asInstanceOf[AnyRef]
-
-    // Create TestAdapter
-    val adapterClass = loader.loadClass("scala.scalanative.testinterface.adapter.TestAdapter")
-    val adapterConstructor = adapterClass.getConstructor(configClass)
-    val adapter = adapterConstructor.newInstance(config.asInstanceOf[AnyRef])
+    val adapter = NativeTestAdapter.open(loader, binary, env)
 
     try {
       eventHandler.onRunnerEvent(RunnerEvent.Started)
 
-      // loadFrameworks takes List[List[String]] - list of framework class name alternatives
       val classNames = frameworkClassNames.getOrElse(framework, frameworkClassNames(TestFramework.Unknown))
-      val scalaClassNames = toScalaList(List(toScalaList(classNames, loader)), loader)
 
-      val loadMethod = adapterClass.getMethod("loadFrameworks", loader.loadClass("scala.collection.immutable.List"))
-      val frameworksResult = loadMethod.invoke(adapter, scalaClassNames.asInstanceOf[AnyRef])
-
-      // Result is List[Option[sbt.testing.Framework]] - convert to Java
-      val frameworksList = fromScalaList[Any](frameworksResult, loader)
-      val foundFramework = frameworksList.flatMap(opt => fromScalaOption[sbt.testing.Framework](opt, loader)).headOption
-
-      foundFramework match {
+      adapter.loadFrameworks(List(classNames)).flatten.headOption match {
         case None =>
           eventHandler.onRunnerEvent(RunnerEvent.Error("No test framework found in native binary", None))
           TestResult(0, 0, 0, 0, TerminationReason.Error("No test framework found"))
 
         case Some(sbtFramework) =>
-          // Create runner
-          val runner = sbtFramework.runner(Array.empty[String], Array.empty[String], loader)
-
-          // Create TaskDefs from suites
-          // TaskDef(fullyQualifiedName, fingerprint, explicitlySpecified, selectors)
-          val fingerprint: sbt.testing.Fingerprint = new sbt.testing.SubclassFingerprint {
-            def superclassName(): String = "java.lang.Object"
-            def isModule(): Boolean = false
-            def requireNoArgConstructor(): Boolean = true
-          }
-          val taskDefs = suites.map { suite =>
-            new sbt.testing.TaskDef(
-              suite.fullyQualifiedName,
-              fingerprint,
-              false,
-              Array(new sbt.testing.SuiteSelector)
-            )
-          }.toArray
-
-          // If no specific suites, discover all
-          val tasks = if (taskDefs.isEmpty) {
-            // Get all tasks by passing empty array - framework discovers
-            runner.tasks(Array.empty)
-          } else {
-            runner.tasks(taskDefs)
-          }
-
-          // Per-suite counters (suite name → (passed, failed, skipped, ignored))
-          val suiteCounts = new scala.collection.mutable.HashMap[String, (Int, Int, Int, Int)]()
-
-          // Execute each task
-          val sbtEventHandler = new sbt.testing.EventHandler {
-            def handle(event: sbt.testing.Event): Unit = {
-              val suiteName = event.fullyQualifiedName()
-              val testName = event.selector() match {
-                case ts: sbt.testing.TestSelector       => ts.testName()
-                case ns: sbt.testing.NestedTestSelector => ns.testName()
-                case _                                  => event.fullyQualifiedName()
-              }
-
-              eventHandler.onTestStarted(suiteName, testName)
-
-              val status = event.status() match {
-                case sbt.testing.Status.Success =>
-                  val (p, f, s, i) = suiteCounts.getOrElse(suiteName, (0, 0, 0, 0))
-                  suiteCounts(suiteName) = (p + 1, f, s, i)
-                  TestStatus.Passed
-                case sbt.testing.Status.Failure =>
-                  val (p, f, s, i) = suiteCounts.getOrElse(suiteName, (0, 0, 0, 0))
-                  suiteCounts(suiteName) = (p, f + 1, s, i)
-                  TestStatus.Failed
-                case sbt.testing.Status.Error =>
-                  val (p, f, s, i) = suiteCounts.getOrElse(suiteName, (0, 0, 0, 0))
-                  suiteCounts(suiteName) = (p, f + 1, s, i)
-                  TestStatus.Error
-                case sbt.testing.Status.Skipped =>
-                  val (p, f, s, i) = suiteCounts.getOrElse(suiteName, (0, 0, 0, 0))
-                  suiteCounts(suiteName) = (p, f, s + 1, i)
-                  TestStatus.Skipped
-                case sbt.testing.Status.Ignored =>
-                  val (p, f, s, i) = suiteCounts.getOrElse(suiteName, (0, 0, 0, 0))
-                  suiteCounts(suiteName) = (p, f, s, i + 1)
-                  TestStatus.Ignored
-                case sbt.testing.Status.Canceled =>
-                  val (p, f, s, i) = suiteCounts.getOrElse(suiteName, (0, 0, 0, 0))
-                  suiteCounts(suiteName) = (p, f, s + 1, i)
-                  TestStatus.Cancelled
-                case sbt.testing.Status.Pending =>
-                  val (p, f, s, i) = suiteCounts.getOrElse(suiteName, (0, 0, 0, 0))
-                  suiteCounts(suiteName) = (p, f, s + 1, i)
-                  TestStatus.Pending
-              }
-
-              val durationMs = event.duration()
-              val message = Option(event.throwable()).flatMap { opt =>
-                if (opt.isDefined) Some(opt.get().getMessage)
-                else None
-              }
-
-              eventHandler.onTestFinished(suiteName, testName, status, durationMs, message)
-            }
-          }
-
-          val sbtLoggers = Array[sbt.testing.Logger](new sbt.testing.Logger {
-            def ansiCodesSupported(): Boolean = false
-            def error(msg: String): Unit = eventHandler.onOutput("", msg, OutputChannel.Stderr)
-            def warn(msg: String): Unit = eventHandler.onOutput("", msg, OutputChannel.Stdout)
-            def info(msg: String): Unit = eventHandler.onOutput("", msg, OutputChannel.Stdout)
-            def debug(msg: String): Unit = ()
-            def trace(t: Throwable): Unit = eventHandler.onOutput("", t.toString, OutputChannel.Stderr)
-          })
-
-          // Track suites
-          val suiteNames = scala.collection.mutable.Set[String]()
-
-          tasks.foreach { task =>
-            val suiteName = task.taskDef().fullyQualifiedName()
-            if (suiteNames.add(suiteName)) {
-              eventHandler.onSuiteStarted(suiteName)
-            }
-
-            val nestedTasks = task.execute(sbtEventHandler, sbtLoggers)
-            // Execute nested tasks recursively
-            def executeNested(nested: Array[sbt.testing.Task]): Unit =
-              nested.foreach { nt =>
-                val ntSuite = nt.taskDef().fullyQualifiedName()
-                if (suiteNames.add(ntSuite)) {
-                  eventHandler.onSuiteStarted(ntSuite)
-                }
-                val moreNested = nt.execute(sbtEventHandler, sbtLoggers)
-                executeNested(moreNested)
-              }
-            executeNested(nestedTasks)
-          }
-
-          // Finish all tracked suites with per-suite counts
-          suiteNames.foreach { name =>
-            val (p, f, s, _) = suiteCounts.getOrElse(name, (0, 0, 0, 0))
-            eventHandler.onSuiteFinished(name, p, f, s)
-          }
-
-          // runner.done() signals the native process to shut down.
-          // It may throw if the native process's RPC handler doesn't support the done opcode,
-          // but by this point all tests have already executed and results are captured.
-          try runner.done()
-          catch { case _: Exception => () }
-          eventHandler.onRunnerEvent(RunnerEvent.ProcessExited(0))
-          val totalPassed = suiteCounts.values.map(_._1).sum
-          val totalFailed = suiteCounts.values.map(_._2).sum
-          val totalSkipped = suiteCounts.values.map(_._3).sum
-          val totalIgnored = suiteCounts.values.map(_._4).sum
-          TestResult(totalPassed, totalFailed, totalSkipped, totalIgnored, TerminationReason.Completed)
+          SbtTestDriver.runFramework(sbtFramework, suites, eventHandler, loader)
       }
     } finally
-      // Close adapter (kills native process)
-      try {
-        val closeMethod = adapterClass.getMethod("close")
-        closeMethod.invoke(adapter): Unit
-      } catch { case _: Exception => () }
+      // A close that throws must not replace the counts the framework already reported.
+      try adapter.close()
+      catch { case _: Exception => () }
   }
 
-  private def toScalaMap(javaMap: Map[String, String], loader: ClassLoader): Any = {
-    val mapCompanion = loader.loadClass("scala.collection.immutable.Map$")
-    val mapObj = mapCompanion.getField("MODULE$").get(null)
-    val emptyMethod = mapCompanion.getMethod("empty")
-    var result = emptyMethod.invoke(mapObj)
-    val updatedMethod = result.getClass.getMethod("updated", classOf[Object], classOf[Object])
-    javaMap.foreach { case (k, v) =>
-      result = updatedMethod.invoke(result, k, v)
+  /** The `scala.scalanative.testinterface.adapter.TestAdapter` that `loader` built.
+    *
+    * Each method here takes the name of the adapter method it reflects into. Each method takes and returns bleep's own types. `underlying` stays inside this
+    * class and its companion.
+    */
+  private case class NativeTestAdapter(underlying: AnyRef, loader: ClassLoader) {
+
+    /** Asks the adapter which of these class names the native binary declares.
+      *
+      * @param classNames
+      *   one list per framework. Each list gives the alternative `sbt.testing.Framework` class names for one framework.
+      * @return
+      *   one entry per framework, in the order the frameworks arrived. An entry is the framework the binary declares.
+      */
+    def loadFrameworks(classNames: List[List[String]]): List[Option[sbt.testing.Framework]] = {
+      val requested = AlienList.of(classNames.map(names => AlienList.of(names, loader).underlying), loader)
+      val loaded = NativeTestAdapter
+        .adapterClass(loader)
+        .getMethod("loadFrameworks", loader.loadClass("scala.collection.immutable.List"))
+        .invoke(underlying, requested.underlying)
+      AlienList(loaded, loader).elements.map(element => AlienOption(element, loader).as[sbt.testing.Framework])
     }
-    result
+
+    /** Closes the adapter. Closing the adapter stops the native process the adapter started. */
+    def close(): Unit =
+      NativeTestAdapter.adapterClass(loader).getMethod("close").invoke(underlying): Unit
   }
 
-  private def toScalaList(javaList: List[Any], loader: ClassLoader): Any = {
-    val nilClass = loader.loadClass("scala.collection.immutable.Nil$")
-    val nilObj = nilClass.getField("MODULE$").get(null)
-    val consClass = loader.loadClass("scala.collection.immutable.$colon$colon")
-    val consConstructor = consClass.getConstructor(classOf[Object], loader.loadClass("scala.collection.immutable.List"))
-    javaList.foldRight(nilObj: Any) { (elem, acc) =>
-      consConstructor.newInstance(elem.asInstanceOf[AnyRef], acc.asInstanceOf[AnyRef])
-    }
-  }
+  private object NativeTestAdapter {
 
-  private def fromScalaList[A](scalaList: Any, loader: ClassLoader): List[A] = {
-    val result = scala.collection.mutable.ListBuffer[A]()
-    var current = scalaList
-    val nilClass = loader.loadClass("scala.collection.immutable.Nil$")
-    val nilObj = nilClass.getField("MODULE$").get(null)
-    while (current != nilObj) {
-      val headMethod = current.getClass.getMethod("head")
-      val tailMethod = current.getClass.getMethod("tail")
-      result += headMethod.invoke(current).asInstanceOf[A]
-      current = tailMethod.invoke(current)
-    }
-    result.toList
-  }
+    /** Starts an adapter that runs `binary` with `env` set. */
+    def open(loader: ClassLoader, binary: Path, env: Map[String, String]): NativeTestAdapter = {
+      // `TestAdapter$Config` is an interface in Scala 3. `Config.apply()` returns a default config. Each `withX` call returns a new config.
+      val configClass = loader.loadClass("scala.scalanative.testinterface.adapter.TestAdapter$Config")
+      var config: AnyRef = configClass.getMethod("apply").invoke(null)
 
-  private def fromScalaOption[A](scalaOption: Any, loader: ClassLoader): Option[A] = {
-    val noneClass = loader.loadClass("scala.None$")
-    val noneObj = noneClass.getField("MODULE$").get(null)
-    if (scalaOption == noneObj) None
-    else {
-      val getMethod = scalaOption.getClass.getMethod("get")
-      Some(getMethod.invoke(scalaOption).asInstanceOf[A])
+      config = configClass.getMethod("withBinaryFile", classOf[java.io.File]).invoke(config, binary.toFile).asInstanceOf[AnyRef]
+
+      config = configClass
+        .getMethod("withEnvVars", loader.loadClass("scala.collection.immutable.Map"))
+        .invoke(config, AlienMap.of(env, loader).underlying)
+        .asInstanceOf[AnyRef]
+
+      val buildLoggerCompanion = loader.loadClass("scala.scalanative.build.Logger$")
+      val defaultLogger = buildLoggerCompanion.getMethod("default").invoke(buildLoggerCompanion.getField("MODULE$").get(null))
+      config = configClass
+        .getMethod("withLogger", loader.loadClass("scala.scalanative.build.Logger"))
+        .invoke(config, defaultLogger)
+        .asInstanceOf[AnyRef]
+
+      NativeTestAdapter(adapterClass(loader).getConstructor(configClass).newInstance(config), loader)
     }
+
+    private def adapterClass(loader: ClassLoader): Class[?] =
+      loader.loadClass("scala.scalanative.testinterface.adapter.TestAdapter")
   }
 
   // Output Parsers

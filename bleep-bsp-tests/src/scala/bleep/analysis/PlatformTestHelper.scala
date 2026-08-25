@@ -2,6 +2,7 @@ package bleep.analysis
 
 import cats.effect.unsafe.implicits.global
 import coursier.cache.CacheLogger
+
 import java.nio.file.{Files, Path}
 
 /** Shared helpers for advanced platform integration tests.
@@ -16,6 +17,19 @@ object PlatformTestHelper {
     val fetchNode = new bleep.FetchNode(CacheLogger.nop, scala.concurrent.ExecutionContext.global)
     fetchNode(DefaultNodeVersion).toAbsolutePath.toString
   }
+
+  /** These scalac flags make the compiler emit `.sjsir`. Scala 3 declares the Scala.js back end itself. Scala 2 reaches that back end through the Scala.js
+    * compiler plugin.
+    */
+  def scalaJsCompilerOptions(scalaVersion: String, sjsVersion: String): List[String] =
+    if (scalaVersion.startsWith("3.")) List("-scalajs")
+    else {
+      val pluginJars = CompilerResolver.resolveScalaJsCompilerPlugin(sjsVersion, scalaVersion)
+      val pluginJar = pluginJars
+        .find(_.getFileName.toString.contains("scalajs-compiler"))
+        .getOrElse(pluginJars.head)
+      List(s"-Xplugin:${pluginJar.toAbsolutePath}")
+    }
 
   /** Unwrap a `ThreadOutcome.Completed` in tests, failing loudly on `Cancelled` or `Crashed`. Lets the rest of a test read the result type's fields directly
     * without inline pattern matching at every call site.
@@ -96,34 +110,42 @@ trait PlatformTestHelper {
       outDir: Path,
       scalaVersion: String,
       sjsVersion: String
+  ): Seq[Path] =
+    compileForScalaJsWithDeps(srcDir, outDir, scalaVersion, sjsVersion, Seq.empty)
+
+  /** Compile Scala sources for Scala.js with extra dependencies on the classpath.
+    *
+    * @param extraDeps
+    *   JAR files the sources import, such as a test framework compiled for Scala.js
+    * @return
+    *   the classpath, which includes the output directory, scalajs-library, and `extraDeps`
+    */
+  def compileForScalaJsWithDeps(
+      srcDir: Path,
+      outDir: Path,
+      scalaVersion: String,
+      sjsVersion: String,
+      extraDeps: Seq[Path]
   ): Seq[Path] = {
     Files.createDirectories(outDir)
 
     val scalaLibJars = CompilerResolver.resolveScalaLibrary(scalaVersion)
     val sjsLibJars = CompilerResolver.resolveScalaJsLibrary(sjsVersion, scalaVersion)
 
-    val scalaOptions: List[String] = if (scalaVersion.startsWith("3.")) {
-      List("-scalajs")
-    } else {
-      val pluginJars = CompilerResolver.resolveScalaJsCompilerPlugin(sjsVersion, scalaVersion)
-      val pluginJar = pluginJars
-        .find(_.getFileName.toString.contains("scalajs-compiler"))
-        .getOrElse(pluginJars.head)
-      List(s"-Xplugin:${pluginJar.toAbsolutePath}")
-    }
-
     val language: ProjectLanguage.ScalaJava = ProjectLanguage.ScalaJava(
       scalaVersion = scalaVersion,
-      scalaOptions = scalaOptions,
+      scalaOptions = PlatformTestHelper.scalaJsCompilerOptions(scalaVersion, sjsVersion),
       javaOptions = Nil,
       ecjVersion = None,
       compileOrder = bleep.model.CompileOrder.JavaThenScala
     )
 
+    val fullClasspath = (scalaLibJars ++ sjsLibJars ++ extraDeps).distinct
+
     val config = ProjectConfig(
       name = "scalajs-compile",
       sources = Set(srcDir),
-      classpath = scalaLibJars ++ sjsLibJars,
+      classpath = fullClasspath,
       outputDir = outDir,
       language = language,
       analysisDir = None,
@@ -144,7 +166,7 @@ trait PlatformTestHelper {
       .unsafeRunSync()
 
     result match {
-      case ProjectCompileSuccess(_, _, _)  => Seq(outDir) ++ scalaLibJars ++ sjsLibJars
+      case ProjectCompileSuccess(_, _, _)  => Seq(outDir) ++ fullClasspath
       case f: ProjectCompileFailure        => throw new RuntimeException(s"Scala.js compilation failed: ${f.errors.map(_.formatted).mkString("\n")}")
       case ProjectCompileCancelled(reason) => throw new RuntimeException(s"Scala.js compilation cancelled: $reason")
     }

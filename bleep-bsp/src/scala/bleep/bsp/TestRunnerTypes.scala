@@ -83,6 +83,44 @@ object TestRunnerTypes {
       fullyQualifiedName: String
   )
 
+  /** A test framework bleep knows how to run. */
+  sealed trait TestFramework {
+    def name: String
+  }
+  object TestFramework {
+    case object MUnit extends TestFramework { val name = "munit" }
+    case object ScalaTest extends TestFramework { val name = "scalatest" }
+    case object UTest extends TestFramework { val name = "utest" }
+    case object Unknown extends TestFramework { val name = "unknown" }
+
+    /** Match a framework name against the frameworks bleep knows.
+      *
+      * `ClasspathTestDiscovery` reports either the `name()` an `sbt.testing.Framework` declares or the label its base-class table uses. munit declares `munit`
+      * where that table says `MUnit`. utest declares `utest` where the table says `uTest`. The comparison ignores case for that reason.
+      *
+      * @return
+      *   `Unknown` for any other framework name. `Unknown` asks a `TestAdapter` to try every candidate class name.
+      */
+    def fromName(frameworkName: String): TestFramework =
+      frameworkName.toLowerCase match {
+        case "munit"     => MUnit
+        case "scalatest" => ScalaTest
+        case "utest"     => UTest
+        case _           => Unknown
+      }
+  }
+
+  /** The `sbt.testing.Framework` implementations to try for each framework, in order.
+    *
+    * `Unknown` lists every candidate class name. A `TestAdapter` takes the whole list and reports which of those classes the linked code declares.
+    */
+  val frameworkClassNames: Map[TestFramework, List[String]] = Map(
+    TestFramework.MUnit -> List("munit.Framework"),
+    TestFramework.ScalaTest -> List("org.scalatest.tools.Framework", "org.scalatest.tools.ScalaTestFramework"),
+    TestFramework.UTest -> List("utest.runner.Framework"),
+    TestFramework.Unknown -> List("munit.Framework", "org.scalatest.tools.Framework", "utest.runner.Framework")
+  )
+
   /** Result of interpreting a process exit code. */
   case class ExitCodeResult(
       adjustedFailed: Int,
